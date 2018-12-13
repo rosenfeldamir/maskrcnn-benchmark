@@ -110,7 +110,8 @@ class COCODemo(object):
         self.model.to(self.device)
         self.min_image_size = min_image_size
 
-        checkpointer = DetectronCheckpointer(cfg, self.model)
+        save_dir = cfg.OUTPUT_DIR
+        checkpointer = DetectronCheckpointer(cfg, self.model, save_dir=save_dir)
         _ = checkpointer.load(cfg.MODEL.WEIGHT)
 
         self.transforms = self.build_transform()
@@ -211,7 +212,8 @@ class COCODemo(object):
             # if we have masks, paste the masks in the right position
             # in the image, as defined by the bounding boxes
             masks = prediction.get_field("mask")
-            masks = self.masker(masks, prediction)
+            # always single image is passed at a time
+            masks = self.masker([masks], [prediction])[0]
             prediction.add_field("mask", masks)
         return prediction
 
