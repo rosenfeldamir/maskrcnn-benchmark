@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.ndimage.morphology import binary_dilation
+from vision_utils.boxutils import *
 
 def block_masks(image,masks,dilation_factor=None,fill_color=0):
 	if dilation_factor is not None:
@@ -11,7 +12,7 @@ def block_masks(image,masks,dilation_factor=None,fill_color=0):
 def mask_from_a_box(mask,box,inflation_factor,is_abs=False):
 	#print('m')
 	my_bb = inflateBox(box, inflation_factor, is_abs=is_abs)
-	boxutils.plotRectangle_img(mask, my_bb, (1, 1, 1), -1)
+	plotRectangle_img(mask, my_bb, (1, 1, 1), -1)
 
 def mask_from_boxes(img,preds,args):
 	mask = img*0

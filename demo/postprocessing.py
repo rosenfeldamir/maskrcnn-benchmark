@@ -1,6 +1,7 @@
 import numpy as np
 from collections import Counter
 from vision_utils.boxutils import *
+from copy import deepcopy
 
 def discard_dets(bb,min_score = .5,discard_type = 'keep_above'):
 	if len(bb) > 0:
@@ -67,7 +68,7 @@ def merge_all_predictions(origs,news,do_nms=True,min_orig_score=.6):
 	bb = []
 	num_orig_empty = 0
 	num_new_empty = 0  
-	for i,(new,orig) in tqdm_notebook(enumerate(zip(news,origs)),total=len(origs),desc='merging'):
+	for (new,orig) in tqdm_notebook(zip(news,origs),total=len(origs),desc='merging'):
 		
 		if len(new) > 0:
 			new = coco_demo.select_top_predictions(new)
@@ -99,12 +100,11 @@ def merge_extra_detections(orig,new,keep_below_t=.5,overlap_t=.5,min_orig_score=
 	
 	if len(new1) == 0:
 		return my_orig,0
-	overlaps,candidates = boxlist_iou(new1,my_orig).max(1)
-	sel_ = candidates[overlaps>=overlap_t]
+	overlaps = boxlist_iou(new1,my_orig).max(1)
 	new_scores = new1.extra_fields['scores']
 	orig_scores = my_orig.extra_fields['scores']
 	n_updated = 0
-	for j,(ovp,cnd,old_score,new_score) in enumerate(zip(overlaps,candidates,orig_scores,new_scores)):
+	for j,(ovp,old_score,new_score) in enumerate(zip(overlaps,orig_scores,new_scores)):
 		if old_score < keep_below_t and ovp >= overlap_t and old_score>=min_orig_score and new_score > old_score:
 			#print(old_score,'==>',new_score)
 			orig_scores[j] = new_score
@@ -114,7 +114,7 @@ def merge_all_predictions2(origs,news,do_nms=True,min_orig_score=.6):
 	bb = []
 	num_orig_empty = 0
 	num_new_empty = 0    
-	for i,(new,orig) in tqdm_notebook(enumerate(zip(news,origs)),total=len(origs),desc='merging'):
+	for (new,orig) in tqdm_notebook(zip(news,origs),total=len(origs),desc='merging'):
 		orig = remove_masks(orig)
 		if len(new) == 0 or len(orig) == 0:
 			bb.append(orig)
