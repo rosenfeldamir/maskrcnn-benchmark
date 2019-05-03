@@ -8,7 +8,7 @@ from tqdm import tqdm
 from maskrcnn_benchmark.modeling.roi_heads.mask_head.inference import Masker
 from maskrcnn_benchmark.structures.bounding_box import BoxList
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
-
+import  pickle
 
 def do_coco_evaluation(
     dataset,
@@ -56,6 +56,8 @@ def do_coco_evaluation(
             res = evaluate_predictions_on_coco(
                 dataset.coco, coco_results[iou_type], file_path, iou_type
             )
+
+
             results.update(res)
     logger.info(results)
     check_expected_results(results, expected_results, expected_results_sigma_tol)
@@ -283,6 +285,9 @@ def evaluate_predictions_on_coco(
     coco_dt = coco_gt.loadRes(str(json_result_file)) if coco_results else COCO()
 
     # coco_dt = coco_gt.loadRes(coco_results)
+
+    #pickle.dump(dict(coco_gt = coco_gt,coco_dt = coco_dt,iou_type=iou_type),open('/home/amir/evaluation_result.pkl','wb'))
+
     coco_eval = COCOeval(coco_gt, coco_dt, iou_type)
     coco_eval.evaluate()
     coco_eval.accumulate()
@@ -338,7 +343,6 @@ class COCOResults(object):
 def check_expected_results(results, expected_results, sigma_tol):
     if not expected_results:
         return
-
     logger = logging.getLogger("maskrcnn_benchmark.inference")
     for task, metric, (mean, std) in expected_results:
         actual_val = results.results[task][metric]

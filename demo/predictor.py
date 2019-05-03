@@ -247,7 +247,7 @@ class COCODemo(object):
         colors = (colors % 255).numpy().astype("uint8")
         return colors
 
-    def overlay_boxes(self, image, predictions):
+    def overlay_boxes(self, image, predictions, box_width=1 ):
         """
         Adds the predicted boxes on top of the image
 
@@ -265,7 +265,7 @@ class COCODemo(object):
             box = box.to(torch.int64)
             top_left, bottom_right = box[:2].tolist(), box[2:].tolist()
             image = cv2.rectangle(
-                image, tuple(top_left), tuple(bottom_right), tuple(color), 1
+                image, tuple(top_left), tuple(bottom_right), tuple(color), box_width
             )
 
         return image
@@ -347,8 +347,8 @@ class COCODemo(object):
         labels = [self.CATEGORIES[i] for i in labels]
         boxes = predictions.bbox
 
-        template = "{}: {:.2f}"
-        for box, score, label in zip(boxes, scores, labels):
+        template = "{}: {:.2f}"        
+        for box, score, label in zip(boxes, scores, labels):            
             x, y = box[:2]
             s = template.format(label, score)
             cv2.putText(

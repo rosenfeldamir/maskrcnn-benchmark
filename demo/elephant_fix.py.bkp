@@ -1,0 +1,458 @@
+import matplotlib.pylab as pylab
+
+import numpy as np
+import argparse
+import os
+from tqdm import tqdm
+import torch
+import pickle
+from glob import glob
+from inhibitor import *
+import skimage.transform
+import elephant_fix
+# this makes our figures bigger
+d = .5
+pylab.rcParams['figure.figsize'] = 20*d, 12*d
+pylab.rc('image', interpolation='bilinear')
+
+from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.data.datasets.coco import COCODataset
+from predictor import COCODemo
+
+config_file = "../configs/caffe2/e2e_mask_rcnn_R_50_FPN_1x_caffe2.yaml"
+# update the config options with the config file
+cfg.merge_from_file(config_file)
+# manual override some options
+cfg.merge_from_list(["MODEL.DEVICE", "cuda:0"])
+
+from pycocotools.coco import COCO
+#from coco_utils import coco_utils
+
+from vision_utils import boxutils
+from maskrcnn_benchmark.structures.bounding_box import BoxList
+from maskrcnn_benchmark.structures.boxlist_ops import cat_boxlist
+from maskrcnn_benchmark.structures.boxlist_ops import boxlist_nms
+
+def remove_masks(p):
+  if 'mask' in p.extra_fields:
+    del p.extra_fields['mask']
+  return p
+def show_preds(img,predictions,get_top=True):
+  image = img.copy()
+  if get_top:
+    top_predictions = coco_demo.select_top_predictions(predictions)
+  else:
+    top_predictions = predictions
+  img_w_boxes = coco_demo.overlay_boxes(image,top_predictions,box_width=2)
+  img_w_boxes_and_names = coco_demo.overlay_class_names(image,top_predictions)
+  return img_w_boxes_and_names
+class coco_utils:
+  def __init__(self, coco):
+    self.coco = coco
+  def load_image(self, v):
+    coco = self.coco        
+    imgPath = osj(imgDir,v['file_name'])
+    img = plt.imread(imgPath)
+    return img
+  def get_anns(self, v):
+    anns = [coco.anns[r] for r in coco.getAnnIds(v['id'])]
+    return anns
+  def show_anns(self, v): # v is an image record
+    coco = self.coco        
+    img = self.load_image(v)
+    plt.imshow(img,interpolation='bilinear')
+    anns = self.get_anns(v)
+    coco.showAnns(anns)
+def predict_and_show(v):
+  image = U.load_image(v)
+  img_orig = image.copy()
+  dd = 1
+  r = 1;
+  fix,ax = plt.subplots(2,1,figsize=(12*dd,r*20*dd))
+  predictions = coco_demo.compute_prediction(image[:,:,::-1])
+  coco_demo.confidence_threshold = .2
+  top_predictions = coco_demo.select_top_predictions(predictions)
+  img_w_boxes = coco_demo.overlay_boxes(image,top_predictions,box_width=2)
+  img_w_boxes_and_names = coco_demo.overlay_class_names(image,top_predictions)
+  ax.flat[1].imshow(img_orig)
+  coco.showAnns(U.get_anns(v))
+  ax.flat[0].imshow(img_w_boxes_and_names)    
+  [r.axis('off') for r in ax.flat]
+  return img_orig,top_predictions
+
+from matplotlib.pyplot import imshow
+U = coco_utils(coco)
+
+from elephant_fix import *
+from maskrcnn_benchmark.data.datasets.evaluation.coco import coco_eval
+#bm4
+dataType='val2017'
+dataDir='/home/amir/data/coco'
+annFile='{}/annotations/instances_{}.json'.format(dataDir,dataType)
+#coco=COCO(annFile)
+from maskrcnn_benchmark.data.datasets.coco import COCODataset
+coco_dataset = COCODataset(annFile,dataDir+'/images/'+'val2017',True)
+
+def bb_int(boxes1,boxes2):
+  res = np.zeros((len(boxes1),len(boxes2)))
+  for i1,b1 in enumerate(boxes1):
+    for i2,b2 in enumerate(boxes2):
+      res[i1,i2] = boxutils.boxArea(boxutils.boxIntersection(b1,b2))
+  return res
+def bb_areas(boxes):
+  return array([boxutils.boxArea(b) for b in boxes])
+
+
+def apply_co_occ(new_preds, orig_preds, co_occ, only_novel_classes, min_thresh=.1):
+	res = []
+	for new,orig in zip(new_preds,orig_preds):
+		orig_classes = orig.extra_fields['labels'].numpy()
+		new_classes = new.extra_fields['labels'].numpy()
+
+		to_keep = [True]*len(new_classes)
+		for i,n in enumerate(new_classes):
+			if only_novel_classes and n in orig_classes:
+				continue
+			p = co_occ[n-1,orig_classes-1]
+			if max(p) < min_thresh:
+				to_keep[i] = False
+		res.append(new[to_keep])
+	return res
+
+
+def dict_to_param_str(d):
+	'''
+	Represents a dictionary as a concatenated list of key1_value1_key2_value2_...
+	'''
+	s = []
+	for k,v in d.items():
+		s.append(k)
+		s.append(v)
+	return '_'.join(map(str,s))
+
+
+def mask_from_a_box(mask,box,inflation_factor):
+	my_bb = inflateBox(box, inflation_factor, is_abs=False)
+	boxutils.plotRectangle_img(mask, my_bb, (1, 1, 1), -1)
+
+def mask_from_boxes(img,preds,args):
+	mask = img*0
+	# let's block the first object. see what happens.
+	for my_bb,bb_score in zip(preds.bbox,preds.extra_fields['scores']):
+		if bb_score >= args.masking_thresh:
+			mask_from_a_box(mask,my_bb,args.inflation_factor)
+	return (mask)
+
+
+def mask_from_masks(img,preds,args):
+	scores = preds.extra_fields['scores']
+	mask = preds.extra_fields['mask'].numpy().squeeze(1).copy()
+	for i, score in enumerate(scores):
+		if score < args.masking_thresh:
+			mask[i] *= 0  # discard low confidence masks
+	mask = np.repeat(mask.max(0, keepdims=True).transpose(1, 2, 0), 3, 2)
+	return mask
+
+def remove_masks(fname):
+	p = pickle.load(open(fname, 'rb'))
+
+	if type(p['preds']) is list and len(p['preds'])==0:
+		p['preds'] = BoxList(torch.Tensor(0,4),(300,300))
+		pickle.dump(p,open(fname, 'wb'))		
+	if 'mask' in p['preds'].extra_fields:
+		del p['preds'].extra_fields['mask']
+		pickle.dump(p, open(fname,'wb'))
+	return p
+
+
+
+
+def detect_masked(img, coco_demo, preds,args,masking_color=128):
+	masking_thresh = args.masking_thresh
+	if args.all_at_once:
+		if args.masking_type == 'bbox':
+			mask = mask_from_boxes(img,preds,args)
+			#mask = get_blocked_image(img,preds.bbox,inflation=masking_args.inflation_factor,is_abs=False,
+			#	block_color=masking_color)
+		else:
+			#mask = mask_from_masks(img,preds) # inflation factor not used here.
+			if len(preds) == 0:
+				mask = img * 0
+			else:
+				mask = mask_from_masks(img, preds, args)
+		if args.negative_masking:
+			mask = 1-mask
+		masked_img = img * mask + (1-mask) * masking_color
+		preds_masked = coco_demo.compute_prediction(masked_img[:,:,::-1])
+		return preds_masked
+	else:
+		all_preds = []
+		ff = preds.extra_fields
+		#if 'mask' in preds.extra_fields:
+		#	del preds.extra_fields['mask']
+		n_above = sum(ff['scores'].numpy()>=args.masking_thresh)
+		for bb,score,mask in tqdm(zip(preds.bbox,ff['scores'],ff['mask']),desc='masking one by one...',total=n_above):
+			if score < args.masking_thresh:
+				continue
+			if args.masking_type == 'bbox':
+				cur_mask = img * 0
+				mask_from_a_box(cur_mask , bb, args.inflation_factor)
+			else:
+				cur_mask = np.repeat(mask.numpy().transpose(1,2,0),3,2)
+			if args.negative_masking:
+				cur_mask = 1-cur_mask
+			masked_img = img * cur_mask + (1-cur_mask) * masking_color
+
+			preds_masked = coco_demo.compute_prediction(masked_img[:,:,::-1])
+
+			all_preds.append(preds_masked)
+			if 'mask' in preds_masked.extra_fields:
+				del preds_masked.extra_fields['mask']
+		if len(all_preds) > 0:
+			all_preds = cat_boxlist(all_preds)
+			all_preds = boxlist_nms(
+					  all_preds,
+					  .5,
+					  max_proposals=100,
+					  score_field="scores")
+		else:
+			all_preds = BoxList(torch.Tensor(0,4),img.shape[:2])
+		return all_preds
+
+def initial_detection(coco_dataset,coco_demo, args, max_images=10**9, savedir=None):
+	D = os.path.join(savedir,'orig')
+	os.makedirs(D,exist_ok=True)
+	pickle.dump(args, open(os.path.join(D, 'args.pkl'), 'wb'));
+	N = min(len(coco_dataset), max_images)
+
+	#for i, (img, target, idx) in tqdm(enumerate(coco_dataset), total=N):
+	for i in tqdm(range(N)):
+		if i == max_images:
+			break
+		idx = i
+
+		k = coco_dataset.id_to_img_map[idx]
+		out_path = os.path.join(D,'{}.pkl'.format(k))
+		if os.path.isfile(out_path):
+			continue
+		img, target, idx_ = coco_dataset[i]
+		assert(idx_ == idx)
+		image = np.array(img)
+		with torch.no_grad():
+			img = image.copy()
+			preds = coco_demo.compute_prediction(img[:,:,::-1])
+			#if 'mask' in preds.extra_fields:
+			#	del preds.extra_fields['mask']
+		pickle.dump(dict(idx=idx,k=k,preds=preds),open(out_path,'wb'))
+
+
+def masked_detection(coco_dataset, coco_demo, args):
+	savedir = args.save_dir
+	D = os.path.join(savedir,'orig')
+
+	masking_args = dict(masking_type = args.masking_type,negative_masking = args.negative_masking,
+		inflation_factor = args.inflation_factor,all_at_once = args.all_at_once, masking_thresh=args.masking_thresh)
+
+	out_D = os.path.join(savedir,dict_to_param_str(masking_args))
+	os.makedirs(out_D,exist_ok = True)
+	pickle.dump(args, open(os.path.join(out_D, 'args.pkl'), 'wb'));
+
+	orig_res_paths = glob(D+'/*.pkl')
+	print('!!!!!!!!!!!!!!')
+	print(out_D)
+
+	N = min(len(coco_dataset),args.max_images)
+
+	#for i,(img,target,idx) in tqdm(enumerate(coco_dataset),total=N):
+	for i in tqdm(range(N)):
+		if i == args.max_images:
+			break
+		idx = i
+		k = coco_dataset.id_to_img_map[idx]
+		out_path = os.path.join(out_D,'{}.pkl'.format(k))
+		if os.path.isfile(out_path):
+			continue
+		p = os.path.join(D,'{}.pkl'.format(k))
+		#cur_res = remove_masks(p)
+		cur_res = pickle.load(open(p,'rb'))
+		idx,k_,pred = cur_res['idx'],cur_res['k'],cur_res['preds']
+		img,target,idx = coco_dataset[i]
+		image = np.array(img)
+		preds = detect_masked(image , coco_demo, pred,args,masking_color=128)
+		if len(preds) > 0:
+			if 'mask' in preds.extra_fields:
+				del preds.extra_fields['mask']
+		pickle.dump(dict(idx=idx,k=k,preds=preds),open(out_path,'wb'))
+
+def main():
+
+	parser = argparse.ArgumentParser(description='Elephant In the Room Fixes')
+
+	parser.add_argument('-dataType',default='val2017')
+	parser.add_argument('-dataDir',default='/home/amir/data/coco')
+	parser.add_argument('-max_images',type=int,default=10,
+		help='maximal number of images')
+	parser.add_argument('-masking_type',default='bbox',choices=['bbox','mask'],
+		help='mask using bounding box (or "mask" to use the predicted mask)')
+	parser.add_argument('-masking_thresh',type=float,default=0.5,
+						help='minimal score for detection to be used as a mask')
+
+	parser.add_argument('-negative_masking',action='store_true', 
+		help='mask only the detection (otherwise mask everything but the detection)')
+
+	parser.add_argument('-all_at_once', action='store_false',
+		help='mask all detections then run (otherwise one by one))')
+
+	parser.add_argument('-inflation-factor', type=float, default=1.0,
+		help = 'how much to change size (multiplicative) of bbox/mask before masking')
+	parser.add_argument('-save-dir',default = '/home/amir/elephant_fix_results')
+	args = parser.parse_args()
+	# loading the mscoco validation set .
+
+	dataType=args.dataType
+	dataDir=args.dataDir
+	annFile='{}/annotations/instances_{}.json'.format(dataDir,dataType)
+	coco=COCO(annFile)
+	cats = coco.loadCats(coco.getCatIds())
+	#nms=[cat['name'] for cat in cats]
+	imgDir = '{}/images/{}'.format(dataDir,dataType)
+	#print('COCO categories: \n{}\n'.format(' '.join(nms)))
+	#nms = set([cat['supercategory'] for cat in cats])
+	#print('COCO supercategories: \n{}'.format(' '.join(nms)))
+
+	coco_demo = COCODemo(
+	cfg,
+	min_image_size=800,
+	confidence_threshold=0.5)
+
+	coco_dataset = COCODataset(annFile, dataDir + '/images/' + args.dataType,True)
+	initial_detection(coco_dataset, coco_demo, args, max_images=args.max_images,savedir=args.save_dir)
+	print(args)
+	masked_detection( coco_dataset, coco_demo, args)
+
+	print('all_at_once:',args.all_at_once)
+
+
+
+def make_mask_from_boxes(img,preds,min_score=0):
+  mask = img*0
+  # let's block the first object. see what happens.
+  for my_bb,bb_score in zip(preds.bbox,preds.extra_fields['scores']):
+    if bb_score >= min_score:
+      elephant_fix.mask_from_a_box(mask,my_bb,1.0)
+  return mask
+def areas_in_mask(preds,M):
+  M_int = skimage.transform.integral_image(M[:,:,0])
+  bb = preds.bbox.numpy().astype(int)
+  starts = [(b,a) for a,b in bb[:,:2]]
+  ends = [(b,a) for a,b in bb[:,2:]]
+  return skimage.transform.integrate(M_int,starts,ends),bb_areas(bb)
+min_orig_score=.6
+
+def remove_spurious2(new_dets,orig_dets,img,min_orig_score=0.6,max_area_in_orig=.7):
+  orig_dets1 = discard_dets(orig_dets,min_orig_score)  
+  if len(orig_dets1) == 0:
+    return new_dets
+  M = make_mask_from_boxes(img,orig_dets1)
+  new_area_in_orig,new_area = areas_in_mask(new_dets,M)  
+  area_ratio = new_area_in_orig/new_area    
+  keep_me = area_ratio < max_area_in_orig
+  new_dets = new_dets[np.nonzero(keep_me)[0]]
+  return new_dets
+def remove_spurious(new_dets,orig_dets,min_orig_score=0.6):
+  orig_dets = discard_dets(orig_dets,min_orig_score)
+  if len(orig_dets) == 0:
+    return new_dets
+  new_area_in_orig = bb_int(new_dets.bbox,orig_dets.bbox)/bb_areas(new_dets.bbox).reshape(-1,1)
+  new_area_in_orig = new_area_in_orig.max(1)
+  max_area_in_orig = .7
+  keep_me = new_area_in_orig < max_area_in_orig
+  new_dets = new_dets[np.nonzero(keep_me)[0]]
+  return new_dets
+def save_img(fn,img,quality=75):
+  if len(img.shape)==2:
+    img = repeat(atleast_3d(array(img)[:,:,0]),3,2)
+  cv2.imwrite(fn,img[:,:,::-1],[int(cv2.IMWRITE_JPEG_QUALITY), quality])
+
+ from maskrcnn_benchmark.structures.bounding_box import BoxList
+def plotRectangle(r, color='r', **kwargs):
+    if isinstance(r, np.ndarray):
+       # print 'd'
+        r = r.tolist()
+   # print r
+    points = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]], ]
+   # print points    
+    line = plt.Polygon(points, closed=True, fill=None, edgecolor=color, **kwargs)
+    plt.gca().add_line(line)
+def get_img_by_name(n):
+  for k,v in coco.imgs.items():
+    if n == v['file_name']:
+      return v
+  raise Exception('image not found')
+from scipy.ndimage.morphology import binary_dilation
+def show_dets(image,predictions,ax=None,sel_top=False):
+  image = image.copy()
+  if sel_top:
+    top_predictions = coco_demo.select_top_predictions(predictions)
+  else:
+    top_predictions = predictions
+  img_w_boxes = coco_demo.overlay_boxes(image,top_predictions,box_width=2)
+  img_w_boxes_and_names = coco_demo.overlay_class_names(image,top_predictions)
+  return img_w_boxes_and_names
+ 
+def s(image,preds,ax=None,ss=True):
+  return Image.fromarray(show_dets(image,preds,ax,ss))
+
+def block_masks(image,masks,dilation_factor=None,fill_color=0):
+  if dilation_factor is not None:
+    masks = binary_dilation(masks,np.ones((dilation_factor,dilation_factor)))
+  
+  m = np.repeat(np.expand_dims(masks,2),3,2)
+  img = (1-m) * fill_color + m*image
+  #img[~m] = fill_color
+  return img.astype(np.uint8)
+
+def show_dets_by_boxes(boxes,detcolor='r'):  
+  for mybox in boxes:
+    bbtype = mybox.getBBType()
+    box = mybox.getAbsoluteBoundingBox(format=BBFormat.XYX2Y2)
+
+    if bbtype.name == 'Detected' and bbtype.value == 2:
+      #print('...')
+      conf = mybox.getConfidence()                
+      if conf > .1:      
+        plotRectangle(box,detcolor,linewidth=3)
+        #print('det',box)
+    else:
+      plotRectangle(box,'green',linestyle='--',lw=3)
+      
+def merge_detections(dets,do_nms = True):
+  my_preds = cat_boxlist(dets)
+  my_preds = my_preds[(-my_preds.extra_fields['scores']).argsort()]
+  if do_nms:
+    my_preds = boxlist_nms(
+                    my_preds,
+                    coco_demo.cfg.MODEL.ROI_HEADS.NMS,
+                    max_proposals=-1,
+                    score_field="scores")
+  return my_preds
+def get_label_names(preds):
+  return [coco_demo.CATEGORIES[q] for q in top_predictions.extra_fields['labels']]
+
+sns.set_context('paper',font_scale=1.5)
+def populate_ap(metrics_obj,fix_val):
+  m = []
+  for c in range(1,len(coco_demo.CATEGORIES)):    
+    is_found = False
+    for z in metrics_obj:
+      if z['class'] == c:
+        is_found = True
+        m.append(dict(class_id=c,ap=z['AP'],fix=fix_val))
+        break
+    if not is_found:
+        m.append(dict(class_id=c,ap=0,fix=fix_val))
+  return m
+  
+
+if __name__ == "__main__":
+	main()
