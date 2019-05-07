@@ -1,6 +1,7 @@
 
 import numpy as np
 from maskrcnn_benchmark.structures.boxlist_ops import boxlist_iou
+from numpy import argsort,zeros
 
 def populate_ap(metrics_obj,fix_val):
 	m = []
@@ -65,7 +66,7 @@ def calc_metrics_single_image(target,pred):
 	return res,img_unique_labels
 
 
-def perform_evaluation(results,coco_dataset):
+def perform_evaluation(results,coco_dataset,coco_eval):
 	coco_dt = coco_eval.prepare_for_coco_detection(results,coco_dataset)
 	cur_eval_results = coco_eval.evaluate_predictions_on_coco(coco_dataset.coco,coco_dt,'/home/amir/res1.json')
-	return dict(eval_results=cur_eval_results)
+	return cur_eval_results

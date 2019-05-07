@@ -85,7 +85,7 @@ def merge_extra_detections2(preds, new_dets_map, filter_by_label=False, ignore_o
     n0 = 0
     n1 = 0
     n2 = 0
-    for ibox, score in tqdm(enumerate(scores), total=len(preds)):
+    for ibox, score in enumerate(scores):
         if ibox not in new_dets_map:
             continue
         n0 += 1
